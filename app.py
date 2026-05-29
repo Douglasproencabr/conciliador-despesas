@@ -1,7 +1,14 @@
 import streamlit as st
 import base64
 import os
+import sys
 from datetime import datetime
+
+# ── Correção de caminhos para o Streamlit Cloud ─────────────────────────────
+# Isso força o Python do servidor a reconhecer a pasta 'services' localmente
+DIRETORIO_RAIZ = os.path.dirname(os.path.abspath(__file__))
+if DIRETORIO_RAIZ not in sys.path:
+    sys.path.append(DIRETORIO_RAIZ)
 
 # ── Configuração da página ──────────────────────────────────────────────────
 st.set_page_config(
@@ -209,4 +216,296 @@ header[data-testid="stHeader"] { background: transparent; }
 }
 
 /* ── ALERTA / STATUS ─────────────────────────── */
-.
+.status-ok {
+    background: rgba(63,185,80,0.1);
+    border: 1px solid rgba(63,185,80,0.3);
+    border-radius: 10px;
+    padding: 16px 20px;
+    color: #3FB950;
+    font-weight: 600;
+    font-size: 14px;
+    margin: 16px 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.status-error {
+    background: rgba(248,81,73,0.1);
+    border: 1px solid rgba(248,81,73,0.3);
+    border-radius: 10px;
+    padding: 16px 20px;
+    color: #F85149;
+    font-weight: 600;
+    font-size: 14px;
+    margin: 16px 0;
+}
+
+/* ── SPINNER ─────────────────────────────────── */
+[data-testid="stSpinner"] { color: #29ABE2 !important; }
+
+/* ── FOOTER ──────────────────────────────────── */
+.ciss-footer {
+    text-align: center;
+    font-size: 11px;
+    color: #30363D;
+    margin-top: 32px;
+    padding-top: 20px;
+    border-top: 1px solid #21262D;
+}
+
+/* Oculta label vazio dos uploaders */
+[data-testid="stFileUploader"] label { display: none; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Logo em base64 ──────────────────────────────────────────────────────────
+def logo_b64():
+    logo_path = os.path.join(os.path.dirname(__file__), "logo_ciss.png")
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return None
+
+
+# ── FUNÇÃO DE CONCILIAÇÃO ADAPTADA ───────────────────────────────────────────
+def processar_conciliacao(excel_bytes, pdf_bytes):
+    # Alterado para importar localmente sem quebrar no ambiente de produção
+    from services.leitor_excel import ler_excel
+    from services.leitor_pdf import extrair_despesas_pdf
+    from services.exportador_excel import gerar_excel_bytes
+
+    fatura   = ler_excel(excel_bytes)
+    paytrack = extrair_despesas_pdf(pdf_bytes)
+
+    fatura_restante = list(fatura)
+    linhas_paytrack = []
+    linhas_sem_lancamento = []
+
+    for item_pt in paytrack:
+        valor_pt = item_pt['valor']
+        data_pt  = item_pt['data']
+
+        match_exato = None
+        match_approx = None
+
+        for idx, item_fat in enumerate(fatura_restante):
+            valor_fat = item_fat['valor']
+            data_fat  = item_fat['data']
+            diff_val  = abs(valor_pt - valor_fat)
+            diff_dias = abs((data_pt - data_fat).days)
+
+            if diff_val <= 0.01 and diff_dias <= 1:
+                match_exato = (idx, item_fat)
+                break
+            elif diff_val <= 0.10 and diff_dias <= 1 and match_approx is None:
+                match_approx = (idx, item_fat)
+
+        if match_exato:
+            idx, item_fat = match_exato
+            fatura_restante.pop(idx)
+            linhas_paytrack.append({
+                'Tipo (Paytrack)':      item_pt['tipo'],
+                'Data (Paytrack)':      item_pt['data'].strftime('%d/%m/%Y'),
+                'Valor (Paytrack)':     item_pt['valor'],
+                'Justificativa':        item_pt['justificativa'],
+                'Descrição (Fatura)':   item_fat['descricao'],
+                'Data (Fatura)':        item_fat['data'].strftime('%d/%m/%Y'),
+                'Valor (Fatura)':       item_fat['valor'],
+                'Diferença':            round(item_fat['valor'] - item_pt['valor'], 2),
+                'Status':               'CONCILIADO',
+            })
+        elif match_approx:
+            idx, item_fat = match_approx
+            fatura_restante.pop(idx)
+            linhas_paytrack.append({
+                'Tipo (Paytrack)':      item_pt['tipo'],
+                'Data (Paytrack)':      item_pt['data'].strftime('%d/%m/%Y'),
+                'Valor (Paytrack)':     item_pt['valor'],
+                'Justificativa':        item_pt['justificativa'],
+                'Descrição (Fatura)':   item_fat['descricao'],
+                'Data (Fatura)':        item_fat['data'].strftime('%d/%m/%Y'),
+                'Valor (Fatura)':       item_fat['valor'],
+                'Diferença':            round(item_fat['valor'] - item_pt['valor'], 2),
+                'Status':               'DIVERGENTE',
+            })
+        else:
+            linhas_paytrack.append({
+                'Tipo (Paytrack)':      item_pt['tipo'],
+                'Data (Paytrack)':      item_pt['data'].strftime('%d/%m/%Y'),
+                'Valor (Paytrack)':     item_pt['valor'],
+                'Justificativa':        item_pt['justificativa'],
+                'Descrição (Fatura)':   '',
+                'Data (Fatura)':        '',
+                'Valor (Fatura)':       None,
+                'Diferença':            None,
+                'Status':               'NÃO ENCONTRADO NA FATURA',
+            })
+
+    for item_fat in fatura_restante:
+        linhas_sem_lancamento.append({
+            'Descrição (Fatura)': item_fat['descricao'],
+            'Data (Fatura)':      item_fat['data'].strftime('%d/%m/%Y'),
+            'Valor (Fatura)':     item_fat['valor'],
+            'Status':             'NÃO LANÇADO NO PAYTRACK',
+        })
+
+    resumo = {
+        'total_paytrack':        len(paytrack),
+        'total_fatura':          len(fatura),
+        'conciliados':           sum(1 for l in linhas_paytrack if l['Status'] == 'CONCILIADO'),
+        'divergentes':           sum(1 for l in linhas_paytrack if l['Status'] == 'DIVERGENTE'),
+        'nao_encontrados':       sum(1 for l in linhas_paytrack if 'NÃO ENCONTRADO' in l['Status']),
+        'nao_lancados':          len(linhas_sem_lancamento),
+        'valor_conciliado':      round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if l['Status'] == 'CONCILIADO'), 2),
+        'valor_divergente':      round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if l['Status'] == 'DIVERGENTE'), 2),
+        'valor_nao_encontrado':  round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if 'NÃO ENCONTRADO' in l['Status']), 2),
+        'valor_nao_lancado':     round(sum(l['Valor (Fatura)']   for l in linhas_sem_lancamento), 2),
+    }
+
+    excel_bytes_out = gerar_excel_bytes(linhas_paytrack, linhas_sem_lancamento, resumo)
+    return excel_bytes_out, resumo
+
+
+# ── HEADER ──────────────────────────────────────────────────────────────────
+logo = logo_b64()
+logo_html = f'<img src="data:image/png;base64,{logo}" style="height:50px; filter: brightness(0) invert(1);" />' if logo else '<span style="font-size:28px;font-weight:900;color:#29ABE2;">CiSS</span>'
+
+st.markdown(f"""
+<div class="ciss-header">
+    {logo_html}
+    <div style="width:1px;height:40px;background:#30363D;margin:0 4px;"></div>
+    <div class="ciss-header-text">
+        <h1>Conciliador de Despesas</h1>
+        <p>Paytrack &nbsp;×&nbsp; Fatura Bradesco Corporativo</p>
+    </div>
+    <span class="version-pill">v2.0</span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── UPLOAD DOS ARQUIVOS ──────────────────────────────────────────────────────
+st.markdown('<div class="section-label">📂 Arquivos de entrada</div>', unsafe_allow_html=True)
+
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**📊 Fatura do Cartão**")
+    st.caption("Extrato Excel exportado pelo banco")
+    excel_file = st.file_uploader("excel", type=["xlsx", "xls"], label_visibility="collapsed", key="excel")
+
+with col2:
+    st.markdown("**📄 Relatório Paytrack**")
+    st.caption("PDF gerado pelo aplicativo Paytrack")
+    pdf_file = st.file_uploader("pdf", type=["pdf"], label_visibility="collapsed", key="pdf")
+
+
+# ── STATUS DOS ARQUIVOS ──────────────────────────────────────────────────────
+files_ok = excel_file is not None and pdf_file is not None
+
+if excel_file:
+    st.success(f"✓ Fatura: **{excel_file.name}** ({excel_file.size/1024:.1f} KB)")
+if pdf_file:
+    st.success(f"✓ Relatório: **{pdf_file.name}** ({pdf_file.size/1024:.1f} KB)")
+
+
+# ── BOTÃO CONCILIAR ──────────────────────────────────────────────────────────
+st.markdown('<div class="ciss-divider"></div>', unsafe_allow_html=True)
+
+iniciar = st.button(
+    "⚡  Iniciar Conciliação",
+    disabled=not files_ok,
+    use_container_width=True,
+)
+
+if not files_ok:
+    st.markdown(
+        '<p style="text-align:center;color:#484F58;font-size:12px;margin-top:8px;">'
+        'Selecione os dois arquivos para habilitar a conciliação</p>',
+        unsafe_allow_html=True,
+    )
+
+
+# ── PROCESSAMENTO ────────────────────────────────────────────────────────────
+if iniciar and files_ok:
+    try:
+        with st.spinner("Processando conciliação..."):
+            # Agora a função executa direto daqui de dentro do escopo local
+            excel_bytes_out, resumo = processar_conciliacao(
+                excel_file.read(),
+                pdf_file.read(),
+            )
+
+        # Guarda no session_state para não reprocessar no re-render
+        st.session_state["resultado"]    = excel_bytes_out
+        st.session_state["resumo"]       = resumo
+        st.session_state["nome_arquivo"] = (
+            f"conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+
+    except Exception as e:
+        st.markdown(
+            f'<div class="status-error">❌ Erro: {e}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ── RESULTADO ────────────────────────────────────────────────────────────────
+if "resultado" in st.session_state:
+    resumo = st.session_state["resumo"]
+
+    st.markdown('<div class="ciss-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">📊 Resultado da conciliação</div>', unsafe_allow_html=True)
+
+    # Badges 2×2
+    st.markdown(f"""
+    <div class="metric-grid">
+        <div class="metric-card mc-green">
+            <div class="metric-top">
+                <span class="metric-icon">✅</span>
+                <span class="metric-num">{resumo['conciliados']}</span>
+            </div>
+            <div class="metric-label">Conciliados</div>
+            <div class="metric-value">R$ {resumo['valor_conciliado']:,.2f}</div>
+        </div>
+        <div class="metric-card mc-yellow">
+            <div class="metric-top">
+                <span class="metric-icon">⚠️</span>
+                <span class="metric-num">{resumo['divergentes']}</span>
+            </div>
+            <div class="metric-label">Divergentes</div>
+            <div class="metric-value">R$ {resumo['valor_divergente']:,.2f}</div>
+        </div>
+        <div class="metric-card mc-red">
+            <div class="metric-top">
+                <span class="metric-icon">❌</span>
+                <span class="metric-num">{resumo['nao_encontrados']}</span>
+            </div>
+            <div class="metric-label">Não encontr. na Fatura</div>
+            <div class="metric-value">R$ {resumo['valor_nao_encontrado']:,.2f}</div>
+        </div>
+        <div class="metric-card mc-orange">
+            <div class="metric-top">
+                <span class="metric-icon">❗</span>
+                <span class="metric-num">{resumo['nao_lancados']}</span>
+            </div>
+            <div class="metric-label">Não lançados no Paytrack</div>
+            <div class="metric-value">R$ {resumo['valor_nao_lancado']:,.2f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Botão de download
+    st.download_button(
+        label="⬇️  Baixar Relatório Excel",
+        data=st.session_state["resultado"],
+        file_name=st.session_state["nome_arquivo"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+
+# ── FOOTER ───────────────────────────────────────────────────────────────────
+st.markdown(
+    '<div class="ciss-footer">CISS Consultoria em Informática, Serviços e Software S/A</div>',
+    unsafe_allow_html=True,
+)
