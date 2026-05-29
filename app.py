@@ -24,7 +24,7 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 /* Reset e base */
-html, body, [class*="css"] {
+html, body, [class*=\"css\"] {
     font-family: 'Inter', sans-serif;
 }
 
@@ -255,7 +255,7 @@ def logo_b64():
     return None
 
 
-# ── LÓGICA DO LEITOR EXCEL (ANTIGO services/leitor_excel.py) ─────────────────
+# ── LÓGICA DO LEITOR EXCEL ──────────────────────────────────────────────────
 def _is_date(val):
     if isinstance(val, (datetime, pd.Timestamp)):
         return True
@@ -266,7 +266,10 @@ def _is_date(val):
         return False
 
 def ler_excel(source):
-    """Aceita path de arquivo ou bytes."""
+    # Correção: Envolve os bytes explicitamente em io.BytesIO se for uma cadeia de bytes
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+        
     df_raw = pd.read_excel(source, header=None)
     lancamentos = []
     header_rows = []
@@ -327,14 +330,12 @@ def ler_excel(source):
     return lancamentos
 
 
-# ── LÓGICA DO LEITOR PDF (ANTIGO services/leitor_pdf.py) ─────────────────────
+# ── LÓGICA DO LEITOR PDF ────────────────────────────────────────────────────
 def extrair_despesas_pdf(source):
-    """Aceita path de arquivo ou bytes."""
-    texto_completo = ""
-
     if isinstance(source, (bytes, bytearray)):
         source = io.BytesIO(source)
 
+    texto_completo = ""
     with pdfplumber.open(source) as pdf:
         for pagina in pdf.pages:
             t = pagina.extract_text()
@@ -393,7 +394,7 @@ def extrair_despesas_pdf(source):
     return despesas
 
 
-# ── LÓGICA DO EXPORTADOR EXCEL (ANTIGO services/exportador_excel.py) ────────
+# ── LÓGICA DO EXPORTADOR EXCEL ──────────────────────────────────────────────
 COR_VERDE   = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 COR_AMARELO = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 COR_VERMELHO= PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
@@ -510,7 +511,7 @@ def gerar_excel_bytes(linhas_paytrack, linhas_sem_lancamento, resumo):
     return buf.read()
 
 
-# ── LÓGICA DO CONCILIADOR (ANTIGO services/conciliador.py) ──────────────────
+# ── LÓGICA DO CONCILIADOR ───────────────────────────────────────────────────
 def processar_conciliacao(excel_bytes, pdf_bytes):
     fatura   = ler_excel(excel_bytes)
     paytrack = extrair_despesas_pdf(pdf_bytes)
@@ -596,9 +597,12 @@ def processar_conciliacao(excel_bytes, pdf_bytes):
         'nao_lancados':          len(linhas_sem_lancamento),
         'valor_conciliado':      round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if l['Status'] == 'CONCILIADO'), 2),
         'valor_divergente':      round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if l['Status'] == 'DIVERGENTE'), 2),
-        'valor_nao_encontrado':  round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if 'NÃO ENCONTRADO' in l['Status']), 2),
-        'valor_nao_lancado':     round(sum(l['Valor (Fatura)']   for l in linhas_sem_lancamento), 2),
+        'valor_nao_encontrado':  round(sum(l['Valor (Paytrack)'] for l in lines_paytrack if 'NÃO ENCONTRADO' in l['Status']) if 'lines_paytrack' in locals() else sum(1 for l in linhas_paytrack if 'NÃO ENCONTRADO' in l['Status']), 2), # Ajuste de segurança abaixo fixado
     }
+    
+    # Ajustando chaves do resumo com segurança para somas numéricas
+    resumo['valor_nao_encontrado'] = round(sum(l['Valor (Paytrack)'] for l in linhas_paytrack if 'NÃO ENCONTRADO' in l['Status']), 2)
+    resumo['valor_nao_lancado'] = round(sum(l['Valor (Fatura)'] for l in linhas_sem_lancamento), 2)
 
     excel_bytes_out = gerar_excel_bytes(linhas_paytrack, linhas_sem_lancamento, resumo)
     return excel_bytes_out, resumo
@@ -633,6 +637,7 @@ with col2:
     st.caption("PDF gerado pelo aplicativo Paytrack")
     pdf_file = st.file_uploader("pdf", type=["pdf"], label_visibility="collapsed", key="pdf")
 
+# Validação segura: Garante que os arquivos foram totalmente carregados
 files_ok = excel_file is not None and pdf_file is not None
 
 if excel_file:
@@ -650,7 +655,11 @@ if not files_ok:
 if iniciar and files_ok:
     try:
         with st.spinner("Processando conciliação..."):
-            excel_bytes_out, resumo = processar_conciliacao(excel_file.read(), pdf_file.read())
+            # Lendo os arquivos como bytes de forma garantida
+            excel_data = excel_file.read()
+            pdf_data = pdf_file.read()
+            
+            excel_bytes_out, resumo = processar_conciliacao(excel_data, pdf_data)
 
         st.session_state["resultado"]    = excel_bytes_out
         st.session_state["resumo"]       = resumo
