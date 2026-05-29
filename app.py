@@ -1,14 +1,14 @@
 import streamlit as st
 import base64
 import os
-import sys
+import io
+import re
 from datetime import datetime
-
-# ── Correção de caminhos para o Streamlit Cloud ─────────────────────────────
-# Isso força o Python do servidor a reconhecer a pasta 'services' localmente
-DIRETORIO_RAIZ = os.path.dirname(os.path.abspath(__file__))
-if DIRETORIO_RAIZ not in sys.path:
-    sys.path.append(DIRETORIO_RAIZ)
+import pandas as pd
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # ── Configuração da página ──────────────────────────────────────────────────
 st.set_page_config(
@@ -216,19 +216,6 @@ header[data-testid="stHeader"] { background: transparent; }
 }
 
 /* ── ALERTA / STATUS ─────────────────────────── */
-.status-ok {
-    background: rgba(63,185,80,0.1);
-    border: 1px solid rgba(63,185,80,0.3);
-    border-radius: 10px;
-    padding: 16px 20px;
-    color: #3FB950;
-    font-weight: 600;
-    font-size: 14px;
-    margin: 16px 0;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
 .status-error {
     background: rgba(248,81,73,0.1);
     border: 1px solid rgba(248,81,73,0.3);
@@ -268,13 +255,263 @@ def logo_b64():
     return None
 
 
-# ── FUNÇÃO DE CONCILIAÇÃO ADAPTADA ───────────────────────────────────────────
-def processar_conciliacao(excel_bytes, pdf_bytes):
-    # Alterado para importar localmente sem quebrar no ambiente de produção
-    from services.leitor_excel import ler_excel
-    from services.leitor_pdf import extrair_despesas_pdf
-    from services.exportador_excel import gerar_excel_bytes
+# ── LÓGICA DO LEITOR EXCEL (ANTIGO services/leitor_excel.py) ─────────────────
+def _is_date(val):
+    if isinstance(val, (datetime, pd.Timestamp)):
+        return True
+    try:
+        pd.to_datetime(val)
+        return True
+    except Exception:
+        return False
 
+def ler_excel(source):
+    """Aceita path de arquivo ou bytes."""
+    df_raw = pd.read_excel(source, header=None)
+    lancamentos = []
+    header_rows = []
+    
+    for i, row in df_raw.iterrows():
+        vals = [str(v).strip() for v in row.values]
+        if 'Data da transação' in vals and 'Lançamentos' in vals:
+            header_rows.append(i)
+
+    if not header_rows:
+        raise Exception(
+            "Formato do Excel não reconhecido. "
+            "Certifique-se de usar a fatura exportada pelo banco."
+        )
+
+    for h in header_rows:
+        row_h = df_raw.iloc[h]
+        cols  = [str(v).strip() for v in row_h.values]
+
+        try:    idx_data  = cols.index('Data da transação')
+        except: idx_data  = 1
+        try:    idx_desc  = cols.index('Lançamentos')
+        except: idx_desc  = 2
+
+        if 'Valor em R$' in cols:
+            idx_valor = cols.index('Valor em R$')
+        elif 'Valor' in cols:
+            idx_valor = cols.index('Valor')
+        else:
+            idx_valor = 7
+
+        for j in range(h + 1, len(df_raw)):
+            row       = df_raw.iloc[j]
+            data_val  = row.iloc[idx_data]
+            desc_val  = row.iloc[idx_desc]
+            valor_val = row.iloc[idx_valor]
+
+            if pd.isna(data_val) or str(data_val).strip() in ('', 'nan'):
+                break
+            if not isinstance(data_val, (datetime, pd.Timestamp)) and not _is_date(data_val):
+                break
+
+            try:
+                valor = float(str(valor_val).replace(',', '.'))
+            except (ValueError, TypeError):
+                continue
+
+            lancamentos.append({
+                'data':     pd.to_datetime(data_val).date(),
+                'descricao': str(desc_val).strip(),
+                'valor':    round(valor, 2),
+                'fonte':    'fatura',
+            })
+
+    if not lancamentos:
+        raise Exception("Nenhum lançamento encontrado no Excel.")
+
+    return lancamentos
+
+
+# ── LÓGICA DO LEITOR PDF (ANTIGO services/leitor_pdf.py) ─────────────────────
+def extrair_despesas_pdf(source):
+    """Aceita path de arquivo ou bytes."""
+    texto_completo = ""
+
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+
+    with pdfplumber.open(source) as pdf:
+        for pagina in pdf.pages:
+            t = pagina.extract_text()
+            if t:
+                texto_completo += t + "\n"
+
+    despesas = []
+    linhas   = texto_completo.split('\n')
+
+    padrao_despesa = re.compile(
+        r'^(.+?)\s+'
+        r'(\d{2}/\d{2}/\d{2})\s+'
+        r'(Cartão Corporativo|Reembolso)'
+        r'.*?BRL\s+'
+        r'([\d.,]+)\s+'
+        r'([\d.,]+)'
+    )
+
+    i = 0
+    while i < len(linhas):
+        linha = linhas[i].strip()
+        m = padrao_despesa.match(linha)
+        if m:
+            tipo        = m.group(1).strip()
+            data_str    = m.group(2)
+            valor_str   = m.group(4).replace('.', '').replace(',', '.')
+
+            try:
+                valor = round(float(valor_str), 2)
+                data  = datetime.strptime(data_str, '%d/%m/%y').date()
+            except (ValueError, TypeError):
+                i += 1
+                continue
+
+            justificativa = ''
+            if i + 1 < len(linhas):
+                prox = linhas[i + 1].strip()
+                if prox.startswith('Justificativa:'):
+                    justificativa = prox.replace('Justificativa:', '').strip()
+                    i += 1
+
+            if 'Desconto em folha' not in tipo:
+                despesas.append({
+                    'tipo':          tipo,
+                    'data':          data,
+                    'recurso':       m.group(3).strip(),
+                    'valor':         valor,
+                    'justificativa': justificativa,
+                    'fonte':         'paytrack',
+                })
+        i += 1
+
+    if not despesas:
+        raise Exception("Nenhuma despesa encontrada no PDF.")
+
+    return despesas
+
+
+# ── LÓGICA DO EXPORTADOR EXCEL (ANTIGO services/exportador_excel.py) ────────
+COR_VERDE   = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+COR_AMARELO = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+COR_VERMELHO= PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
+COR_LARANJA = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+COR_CINZA   = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+COR_HEADER  = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+
+FONTE_HEADER = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+FONTE_BOLD   = Font(bold=True, name="Calibri", size=10)
+FONTE_NORMAL = Font(name="Calibri", size=10)
+FONTE_TITULO = Font(bold=True, name="Calibri", size=13, color="1F4E79")
+
+borda = Border(
+    left=Side(style='thin', color="BFBFBF"),
+    right=Side(style='thin', color="BFBFBF"),
+    top=Side(style='thin', color="BFBFBF"),
+    bottom=Side(style='thin', color="BFBFBF"),
+)
+
+def _h(ws, row, col, texto):
+    c = ws.cell(row=row, column=col, value=texto)
+    c.fill = COR_HEADER; c.font = FONTE_HEADER; c.border = borda
+    c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+def _c(ws, row, col, value, fill=None, bold=False, fmt=None, align='left'):
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = FONTE_BOLD if bold else FONTE_NORMAL
+    c.alignment = Alignment(horizontal=align, vertical='center')
+    c.border = borda
+    if fill: c.fill = fill
+    if fmt:  c.number_format = fmt
+
+def gerar_excel_bytes(linhas_paytrack, linhas_sem_lancamento, resumo):
+    wb = Workbook()
+
+    # Aba Resumo
+    ws = wb.active
+    ws.title = "📊 Resumo"
+    ws.column_dimensions['A'].width = 38
+    ws.column_dimensions['B'].width = 14
+    ws.column_dimensions['C'].width = 18
+
+    ws.merge_cells('A1:C1')
+    ws['A1'].value = "CONCILIAÇÃO DE DESPESAS — RELATÓRIO EXECUTIVO"
+    ws['A1'].font  = FONTE_TITULO
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[1].height = 30
+
+    for col, label in enumerate(['Situação', 'Qtd', 'Valor Total (R$)'], 1):
+        c = ws.cell(row=3, column=col, value=label)
+        c.font = FONTE_BOLD; c.fill = COR_CINZA; c.border = borda
+        c.alignment = Alignment(horizontal='center')
+
+    dados = [
+        ("✅ Conciliados",               resumo['conciliados'],      resumo['valor_conciliado'],     COR_VERDE),
+        ("⚠️ Divergentes",               resumo['divergentes'],      resumo['valor_divergente'],     COR_AMARELO),
+        ("❌ No Paytrack, não na Fatura", resumo['nao_encontrados'],  resumo['valor_nao_encontrado'], COR_VERMELHO),
+        ("❗ Na Fatura, não no Paytrack", resumo['nao_lancados'],     resumo['valor_nao_lancado'],    COR_LARANJA),
+    ]
+    for i, (label, qtd, val, fill) in enumerate(dados, 4):
+        _c(ws, i, 1, label,  fill=fill, bold=True)
+        _c(ws, i, 2, qtd,    fill=fill, bold=True, align='center')
+        _c(ws, i, 3, val,    fill=fill, bold=True, fmt='R$ #,##0.00', align='right')
+
+    # Aba Conciliação Paytrack
+    ws2 = wb.create_sheet("📋 Conciliação Paytrack")
+    cols = [
+        ('Tipo (Paytrack)', 18), ('Data (Paytrack)', 14), ('Valor (Paytrack)', 15),
+        ('Justificativa', 35),   ('Descrição (Fatura)', 25), ('Data (Fatura)', 14),
+        ('Valor (Fatura)', 14),  ('Diferença', 12),           ('Status', 25),
+    ]
+    for ci, (nome, larg) in enumerate(cols, 1):
+        _h(ws2, 1, ci, nome)
+        ws2.column_dimensions[get_column_letter(ci)].width = larg
+    ws2.row_dimensions[1].height = 30
+    ws2.freeze_panes = 'A2'
+
+    sf = {'CONCILIADO': COR_VERDE, 'DIVERGENTE': COR_AMARELO, 'NÃO ENCONTRADO NA FATURA': COR_VERMELHO}
+    for ri, l in enumerate(linhas_paytrack, 2):
+        f = sf.get(l['Status'], COR_CINZA)
+        _c(ws2,ri,1,l['Tipo (Paytrack)'],f)
+        _c(ws2,ri,2,l['Data (Paytrack)'],f,align='center')
+        _c(ws2,ri,3,l['Valor (Paytrack)'],f,fmt='R$ #,##0.00',align='right')
+        _c(ws2,ri,4,l['Justificativa'],f)
+        _c(ws2,ri,5,l['Descrição (Fatura)'],f)
+        _c(ws2,ri,6,l['Data (Fatura)'],f,align='center')
+        v = l['Valor (Fatura)']
+        _c(ws2,ri,7,v,f,fmt='R$ #,##0.00' if v else None,align='right')
+        d = l['Diferença']
+        _c(ws2,ri,8,d,f,fmt='R$ #,##0.00' if d is not None else None,align='right')
+        _c(ws2,ri,9,l['Status'],f,bold=True,align='center')
+
+    # Aba Não Lançados
+    ws3 = wb.create_sheet("❗ Não Lançados Paytrack")
+    for ci, (nome, larg) in enumerate([('Descrição (Fatura)',35),('Data (Fatura)',14),('Valor (Fatura)',15),('Status',30)], 1):
+        _h(ws3, 1, ci, nome)
+        ws3.column_dimensions[get_column_letter(ci)].width = larg
+    ws3.row_dimensions[1].height = 30
+    ws3.freeze_panes = 'A2'
+
+    for ri, l in enumerate(linhas_sem_lancamento, 2):
+        _c(ws3,ri,1,l['Descrição (Fatura)'],COR_LARANJA)
+        _c(ws3,ri,2,l['Data (Fatura)'],COR_LARANJA,align='center')
+        _c(ws3,ri,3,l['Valor (Fatura)'],COR_LARANJA,fmt='R$ #,##0.00',align='right')
+        _c(ws3,ri,4,l['Status'],COR_LARANJA,bold=True,align='center')
+
+    if not linhas_sem_lancamento:
+        ws3.cell(row=2,column=1,value="✅ Todos os lançamentos da fatura foram encontrados no Paytrack!")
+        ws3.cell(row=2,column=1).font = Font(bold=True, color="375623", size=11)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+# ── LÓGICA DO CONCILIADOR (ANTIGO services/conciliador.py) ──────────────────
+def processar_conciliacao(excel_bytes, pdf_bytes):
     fatura   = ler_excel(excel_bytes)
     paytrack = extrair_despesas_pdf(pdf_bytes)
 
@@ -367,7 +604,7 @@ def processar_conciliacao(excel_bytes, pdf_bytes):
     return excel_bytes_out, resumo
 
 
-# ── HEADER ──────────────────────────────────────────────────────────────────
+# ── INTERFACE GRÁFICA DO STREAMLIT ───────────────────────────────────────────
 logo = logo_b64()
 logo_html = f'<img src="data:image/png;base64,{logo}" style="height:50px; filter: brightness(0) invert(1);" />' if logo else '<span style="font-size:28px;font-weight:900;color:#29ABE2;">CiSS</span>'
 
@@ -383,8 +620,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-
-# ── UPLOAD DOS ARQUIVOS ──────────────────────────────────────────────────────
 st.markdown('<div class="section-label">📂 Arquivos de entrada</div>', unsafe_allow_html=True)
 
 col1, col2 = st.columns(2)
@@ -398,8 +633,6 @@ with col2:
     st.caption("PDF gerado pelo aplicativo Paytrack")
     pdf_file = st.file_uploader("pdf", type=["pdf"], label_visibility="collapsed", key="pdf")
 
-
-# ── STATUS DOS ARQUIVOS ──────────────────────────────────────────────────────
 files_ok = excel_file is not None and pdf_file is not None
 
 if excel_file:
@@ -407,94 +640,50 @@ if excel_file:
 if pdf_file:
     st.success(f"✓ Relatório: **{pdf_file.name}** ({pdf_file.size/1024:.1f} KB)")
 
-
-# ── BOTÃO CONCILIAR ──────────────────────────────────────────────────────────
 st.markdown('<div class="ciss-divider"></div>', unsafe_allow_html=True)
 
-iniciar = st.button(
-    "⚡  Iniciar Conciliação",
-    disabled=not files_ok,
-    use_container_width=True,
-)
+iniciar = st.button("⚡  Iniciar Conciliação", disabled=not files_ok, use_container_width=True)
 
 if not files_ok:
-    st.markdown(
-        '<p style="text-align:center;color:#484F58;font-size:12px;margin-top:8px;">'
-        'Selecione os dois arquivos para habilitar a conciliação</p>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<p style="text-align:center;color:#484F58;font-size:12px;margin-top:8px;">Selecione os dois arquivos para habilitar a conciliação</p>', unsafe_allow_html=True)
 
-
-# ── PROCESSAMENTO ────────────────────────────────────────────────────────────
 if iniciar and files_ok:
     try:
         with st.spinner("Processando conciliação..."):
-            # Agora a função executa direto daqui de dentro do escopo local
-            excel_bytes_out, resumo = processar_conciliacao(
-                excel_file.read(),
-                pdf_file.read(),
-            )
+            excel_bytes_out, resumo = processar_conciliacao(excel_file.read(), pdf_file.read())
 
-        # Guarda no session_state para não reprocessar no re-render
         st.session_state["resultado"]    = excel_bytes_out
         st.session_state["resumo"]       = resumo
-        st.session_state["nome_arquivo"] = (
-            f"conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        )
-
+        st.session_state["nome_arquivo"] = f"conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     except Exception as e:
-        st.markdown(
-            f'<div class="status-error">❌ Erro: {e}</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="status-error">❌ Erro: {e}</div>', unsafe_allow_html=True)
 
-
-# ── RESULTADO ────────────────────────────────────────────────────────────────
 if "resultado" in st.session_state:
     resumo = st.session_state["resumo"]
-
     st.markdown('<div class="ciss-divider"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">📊 Resultado da conciliação</div>', unsafe_allow_html=True)
 
-    # Badges 2×2
     st.markdown(f"""
     <div class="metric-grid">
         <div class="metric-card mc-green">
-            <div class="metric-top">
-                <span class="metric-icon">✅</span>
-                <span class="metric-num">{resumo['conciliados']}</span>
-            </div>
-            <div class="metric-label">Conciliados</div>
-            <div class="metric-value">R$ {resumo['valor_conciliado']:,.2f}</div>
+            <div class="metric-top"><span class="metric-icon">✅</span><span class="metric-num">{resumo['conciliados']}</span></div>
+            <div class="metric-label">Conciliados</div><div class="metric-value">R$ {resumo['valor_conciliado']:,.2f}</div>
         </div>
         <div class="metric-card mc-yellow">
-            <div class="metric-top">
-                <span class="metric-icon">⚠️</span>
-                <span class="metric-num">{resumo['divergentes']}</span>
-            </div>
-            <div class="metric-label">Divergentes</div>
-            <div class="metric-value">R$ {resumo['valor_divergente']:,.2f}</div>
+            <div class="metric-top"><span class="metric-icon">⚠️</span><span class="metric-num">{resumo['divergentes']}</span></div>
+            <div class="metric-label">Divergentes</div><div class="metric-value">R$ {resumo['valor_divergente']:,.2f}</div>
         </div>
         <div class="metric-card mc-red">
-            <div class="metric-top">
-                <span class="metric-icon">❌</span>
-                <span class="metric-num">{resumo['nao_encontrados']}</span>
-            </div>
-            <div class="metric-label">Não encontr. na Fatura</div>
-            <div class="metric-value">R$ {resumo['valor_nao_encontrado']:,.2f}</div>
+            <div class="metric-top"><span class="metric-icon">❌</span><span class="metric-num">{resumo['nao_encontrados']}</span></div>
+            <div class="metric-label">Não encontr. na Fatura</div><div class="metric-value">R$ {resumo['valor_nao_encontrado']:,.2f}</div>
         </div>
         <div class="metric-card mc-orange">
-            <div class="metric-top">
-                <span class="metric-icon">❗</span>
-                <span class="metric-num">{resumo['nao_lancados']}</span>
-            </div>
-            <div class="metric-label">Não lançados no Paytrack</div>
-            <div class="metric-value">R$ {resumo['valor_nao_lancado']:,.2f}</div>
+            <div class="metric-top"><span class="metric-icon">❗</span><span class="metric-num">{resumo['nao_lancados']}</span></div>
+            <div class="metric-label">Não lançados no Paytrack</div><div class="metric-value">R$ {resumo['valor_nao_lancado']:,.2f}</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Botão de download
     st.download_button(
         label="⬇️  Baixar Relatório Excel",
         data=st.session_state["resultado"],
@@ -503,9 +692,4 @@ if "resultado" in st.session_state:
         use_container_width=True,
     )
 
-
-# ── FOOTER ───────────────────────────────────────────────────────────────────
-st.markdown(
-    '<div class="ciss-footer">CISS Consultoria em Informática, Serviços e Software S/A</div>',
-    unsafe_allow_html=True,
-)
+st.markdown('<div class="ciss-footer">CISS Consultoria em Informática, Serviços e Software S/A</div>', unsafe_allow_html=True)
