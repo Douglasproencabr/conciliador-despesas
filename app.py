@@ -610,7 +610,7 @@ def processar_conciliacao(excel_bytes, pdf_bytes):
 
 # ── INTERFACE GRÁFICA DO STREAMLIT ───────────────────────────────────────────
 logo = logo_b64()
-logo_html = f'<img src="data:image/png;base64,{logo}" style="height:50px; filter: brightness(0) invert(1);" />' if logo else '<span style="font-size:28px;font-weight:900;color:#29ABE2;">CiSS</span>'
+logo_html = f'<img src="data:image/png;base64,{logo}" style="height:50px; object-fit: contain;" />' if logo else '<span style="font-size:28px;font-weight:900;color:#29ABE2;">CiSS</span>'
 
 st.markdown(f"""
 <div class="ciss-header">
